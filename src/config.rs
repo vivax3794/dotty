@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::io;
+use std::process::Command;
 
 use anyhow::Result;
 use colored::Colorize;
@@ -62,6 +64,7 @@ pub struct File {
     source: Box<str>,
     priority: u8,
     post_hook: Option<Box<str>>,
+    sudo: bool,
 }
 
 impl Default for File {
@@ -70,6 +73,7 @@ impl Default for File {
             source: "".into(),
             priority: 50,
             post_hook: None,
+            sudo: false,
         }
     }
 }
@@ -295,7 +299,7 @@ impl Config {
             let source = source.canonicalize().unwrap_or(source);
             let target = target.canonicalize().unwrap_or(target);
 
-            if is_new || !target.exists() {
+            if is_new || !target.exists() || source.is_dir() {
                 changes.push(Change::CopyFile(file.clone(), target));
             } else {
                 let source_changed = std::fs::metadata(&source)?.modified()?;
@@ -398,7 +402,12 @@ impl Change {
                 let mut actions = Vec::with_capacity(2);
                 let source = PathBuf::from_str(&file.source).unwrap();
 
-                actions.push(Action::Copy(source, target));
+                if file.sudo {
+                    actions.push(Action::CopySudo(source, target));
+                } else {
+                    actions.push(Action::Copy(source, target));
+                }
+
                 if let Some(command) = &file.post_hook {
                     actions.push(Action::Run {
                         command: command.clone(),
@@ -437,6 +446,7 @@ fn construct_command(
 pub enum Action {
     Run { command: Box<str>, sudo: bool },
     Copy(PathBuf, PathBuf),
+    CopySudo(PathBuf, PathBuf),
 }
 
 impl Action {
@@ -450,7 +460,7 @@ impl Action {
                 command,
                 sudo: true,
             } => format!("sudo {}", command).yellow(),
-            Self::Copy(source, target) => {
+            Self::Copy(source, target) | Self::CopySudo(source, target) => {
                 format!("{} -> {}", source.display(), target.display()).purple()
             }
         }
@@ -480,11 +490,81 @@ impl Action {
                         &CopyOptions::new().overwrite(true).content_only(true),
                     )?;
                 } else {
+                    let parent = target.parent().unwrap();
+                    std::fs::create_dir_all(&parent)?;
                     std::fs::copy(&source, &target)?;
                 }
+            }
+            Self::CopySudo(source, target) => {
+                sudo_copy(&source, &target)?;
             }
         }
 
         Ok(())
     }
+}
+
+fn sudo_create_dir_all(path: &Path) -> io::Result<()> {
+    let path_str = path.to_str().unwrap();
+    let status = Command::new("sudo")
+        .arg("mkdir")
+        .arg("-p")
+        .arg(path_str)
+        .status()?;
+
+    if !status.success() {
+        return Err(io::Error::new(io::ErrorKind::Other, "Failed to create directory"));
+    }
+
+    Ok(())
+}
+
+fn sudo_copy_file(source: &Path, target: &Path) -> io::Result<()> {
+    let source_str = source.to_str().unwrap();
+    let target_str = target.to_str().unwrap();
+    let status = Command::new("sudo")
+        .arg("cp")
+        .arg(source_str)
+        .arg(target_str)
+        .status()?;
+
+    if !status.success() {
+        return Err(io::Error::new(io::ErrorKind::Other, "Failed to copy file"));
+    }
+
+    Ok(())
+}
+
+fn sudo_copy_dir(source: &Path, target: &Path) -> io::Result<()> {
+    let source_str = source.to_str().unwrap();
+    let target_str = target.to_str().unwrap();
+
+    // Construct `fs_extra`-style copy command manually
+    let mut cmd = Command::new("sudo");
+    cmd.arg("cp")
+        .arg("-r")
+        .arg(source_str)
+        .arg(target_str)
+        .arg("--remove-destination"); // Force overwrite of existing files
+
+    let status = cmd.status()?;
+    if !status.success() {
+        return Err(io::Error::new(io::ErrorKind::Other, "Failed to copy directory"));
+    }
+
+    Ok(())
+}
+
+fn sudo_copy(source: &Path, target: &Path) -> io::Result<()> {
+    if source.is_dir() {
+        // Handle directory copy
+        sudo_create_dir_all(target)?;
+        sudo_copy_dir(source, target)?;
+    } else {
+        // Handle file copy
+        let parent = target.parent().unwrap();
+        sudo_create_dir_all(parent)?;
+        sudo_copy_file(source, target)?;
+    }
+    Ok(())
 }

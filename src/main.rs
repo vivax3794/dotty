@@ -99,23 +99,16 @@ fn main() -> Result<()> {
             let config = read_config(&cli.config_path())?;
             let state = read_config(&cli.state_path()).unwrap_or_default();
 
-            let changes = config.diff(state)?;
-            if !changes.is_empty() {
-                println!("[*] Config and state are different");
-                do_debug(cli, DebugCommand::PrintDiff)?;
-                println!("{}", "[*] Please run `dotty apply` before updating".green());
-            } else {
-                let changes = config.update()?;
-                for change in changes {
-                    println!("[*] {}", change.render());
-                    let actions = change.action(&config)?;
-                    for action in actions {
-                        println!("[>] {}", action.render());
-                        action.execute()?
-                    }
+            let changes = config.update()?;
+            for change in changes {
+                println!("[*] {}", change.render());
+                let actions = change.action(&config)?;
+                for action in actions {
+                    println!("[>] {}", action.render());
+                    action.execute()?
                 }
-                write_config(&cli.state_path(), &config)?;
             }
+            write_config(&cli.state_path(), &config)?;
         }
     }
 
