@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::io;
+use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::FromStr;
 
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use colored::Colorize;
 use fs_extra::dir::CopyOptions;
 use serde::{Deserialize, Serialize};
@@ -12,20 +13,42 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 #[serde(untagged)]
-enum StringyValue<T> {
+enum ShorthandOrTable<T> {
     String(Box<str>),
     Value(T),
 }
 
-impl<T> StringyValue<T>
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+#[serde(from = "ShorthandOrTable<T>", into = "ShorthandOrTable<T>")]
+struct SupportsShorthand<T: From<Box<str>> + Clone>(T);
+
+impl<T: From<Box<str>> + Clone> From<ShorthandOrTable<T>> for SupportsShorthand<T>
 where
-    T: From<Box<str>> + Clone,
+    T: From<Box<str>>,
 {
-    fn value(&self) -> T {
-        match self {
-            Self::String(x) => x.clone().into(),
-            Self::Value(x) => x.clone(),
+    fn from(value: ShorthandOrTable<T>) -> Self {
+        match value {
+            ShorthandOrTable::String(x) => Self(x.into()),
+            ShorthandOrTable::Value(x) => Self(x),
         }
+    }
+}
+
+impl<T: From<Box<str>> + Clone> From<SupportsShorthand<T>> for ShorthandOrTable<T> {
+    fn from(value: SupportsShorthand<T>) -> Self {
+        ShorthandOrTable::Value(value.0)
+    }
+}
+
+impl<T: From<Box<str>> + Clone> Deref for SupportsShorthand<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl<T: From<Box<str>> + Clone> DerefMut for SupportsShorthand<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 
@@ -38,7 +61,8 @@ pub struct Config {
     module: Module,
     dotty: DottyConfig,
     hooks: Hooks,
-    files: HashMap<Box<str>, StringyValue<File>>,
+    files: HashMap<Box<str>, SupportsShorthand<File>>,
+    template: TemplateContext,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
@@ -53,8 +77,8 @@ pub struct Module {
 #[serde(default)]
 #[serde(deny_unknown_fields)]
 pub struct Hooks {
-    once: HashMap<Box<str>, StringyValue<Hook>>,
-    update: HashMap<Box<str>, StringyValue<Hook>>,
+    once: HashMap<Box<str>, SupportsShorthand<Hook>>,
+    update: HashMap<Box<str>, SupportsShorthand<Hook>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
@@ -143,6 +167,45 @@ impl Default for Manager {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+#[serde(transparent)]
+struct TemplateContext(HashMap<Box<str>, TemplateValue>);
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[serde(untagged)]
+enum TemplateValue {
+    Value(Box<str>),
+    Mapping(HashMap<Box<str>, TemplateValue>),
+    Sequence(Vec<TemplateValue>),
+}
+
+impl TemplateValue {
+    fn combine(&mut self, other: TemplateValue) -> Result<()> {
+        match (self, other) {
+            (Self::Value(b), Self::Value(a)) => {
+                return Err(anyhow!("Duplicate value in tempalte {a} and {b}"))
+            }
+            (Self::Sequence(me), Self::Sequence(other)) => me.extend(other),
+            (Self::Mapping(me), Self::Mapping(other)) => {
+                for (key, value) in other {
+                    if let Some(current) = me.get_mut(&key) {
+                        current.combine(value).context(format!("in {key}"))?;
+                    } else {
+                        me.insert(key, value);
+                    }
+                }
+            }
+            (me, other) => {
+                return Err(anyhow!("Incompatible template values {me:?} and {other:?}"))
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl Config {
     pub fn example() -> Self {
         Self {
@@ -162,10 +225,11 @@ impl Config {
             hooks: Hooks::default(),
             dotty: DottyConfig {},
             files: HashMap::new(),
+            template: TemplateContext::default(),
         }
     }
 
-    pub fn combine(&mut self, other: Config) {
+    pub fn combine(&mut self, other: Config) -> Result<()> {
         self.managers.extend(other.managers);
         self.hooks.once.extend(other.hooks.once);
         self.hooks.update.extend(other.hooks.update);
@@ -174,6 +238,16 @@ impl Config {
         for (manager, packages) in other.packages {
             self.packages.entry(manager).or_default().extend(packages);
         }
+
+        for (key, value) in other.template.0 {
+            if let Some(current) = self.template.0.get_mut(&key) {
+                current.combine(value)?;
+            } else {
+                self.template.0.insert(key, value);
+            }
+        }
+
+        Ok(())
     }
 
     pub fn load_dependencies(&mut self, directory: &Path) -> Result<()> {
@@ -188,7 +262,7 @@ impl Config {
             let mut config: Self = toml::from_str(&content)?;
             let new_directory = path.parent().unwrap_or(directory);
             config.load_dependencies(new_directory)?;
-            self.combine(config);
+            self.combine(config)?;
         }
         self.module = Module::default();
         Ok(())
@@ -225,9 +299,8 @@ impl Config {
         }
 
         for hook in self.hooks.update.values() {
-            let hook = hook.value();
             changes.push(Change::RawCommand {
-                command: hook.command,
+                command: hook.command.clone(),
                 priority: hook.priority,
             });
         }
@@ -272,9 +345,8 @@ impl Config {
         }
 
         for (name, hook) in self.hooks.once.iter() {
-            let hook = hook.value();
             let run_hook = if let Some(old_value) = old.hooks.once.get(name) {
-                hook.command != old_value.value().command
+                hook.command != old_value.command
             } else {
                 true
             };
@@ -286,8 +358,9 @@ impl Config {
             }
         }
 
+        let redo_all_templates = self.template != old.template;
+
         for (target, file) in self.files.iter() {
-            let file = file.value();
             let is_new = !old.files.contains_key(target);
 
             let source = shellexpand::tilde(&file.source);
@@ -299,14 +372,19 @@ impl Config {
             let source = source.canonicalize().unwrap_or(source);
             let target = target.canonicalize().unwrap_or(target);
 
-            if is_new || !target.exists() || source.is_dir() {
-                changes.push(Change::CopyFile(file.clone(), target));
+            let is_template = source.extension().is_some_and(|ext| ext == "tera");
+
+            // TODO: Make directory handling smarter
+            // TODO: Make template handling smarter
+            if is_new || !target.exists() || source.is_dir() || (is_template && redo_all_templates)
+            {
+                changes.push(Change::CopyFile((**file).clone(), target));
             } else {
                 let source_changed = std::fs::metadata(&source)?.modified()?;
                 let target_changed = std::fs::metadata(&target)?.modified()?;
 
                 if source_changed > target_changed {
-                    changes.push(Change::CopyFile(file.clone(), target));
+                    changes.push(Change::CopyFile((**file).clone(), target));
                 }
             }
         }
@@ -402,7 +480,20 @@ impl Change {
                 let mut actions = Vec::with_capacity(2);
                 let source = PathBuf::from_str(&file.source).unwrap();
 
-                if file.sudo {
+                let is_template = source.extension().is_some_and(|ext| ext == "tera");
+
+                if is_template {
+                    if file.sudo {
+                        return Err(anyhow!("Can not use `sudo` with templates"));
+                    }
+
+                    let mut templater = tera::Tera::default();
+                    templater.add_template_file(source, Some("template"))?;
+                    let context = tera::Context::from_serialize(&config.template)?;
+                    let rendered = templater.render("template", &context)?;
+
+                    actions.push(Action::StoreFile(rendered.into_boxed_str(), target));
+                } else if file.sudo {
                     actions.push(Action::CopySudo(source, target));
                 } else {
                     actions.push(Action::Copy(source, target));
@@ -447,6 +538,7 @@ pub enum Action {
     Run { command: Box<str>, sudo: bool },
     Copy(PathBuf, PathBuf),
     CopySudo(PathBuf, PathBuf),
+    StoreFile(Box<str>, PathBuf),
 }
 
 impl Action {
@@ -463,6 +555,7 @@ impl Action {
             Self::Copy(source, target) | Self::CopySudo(source, target) => {
                 format!("{} -> {}", source.display(), target.display()).purple()
             }
+            Self::StoreFile(_, target) => format!("<template> -> {}", target.display()).purple(),
         }
     }
 
@@ -491,12 +584,17 @@ impl Action {
                     )?;
                 } else {
                     let parent = target.parent().unwrap();
-                    std::fs::create_dir_all(&parent)?;
+                    std::fs::create_dir_all(parent)?;
                     std::fs::copy(&source, &target)?;
                 }
             }
             Self::CopySudo(source, target) => {
                 sudo_copy(&source, &target)?;
+            }
+            Self::StoreFile(content, target) => {
+                let parent = target.parent().unwrap();
+                std::fs::create_dir_all(parent)?;
+                std::fs::write(target, content.as_ref())?;
             }
         }
 
@@ -513,7 +611,10 @@ fn sudo_create_dir_all(path: &Path) -> io::Result<()> {
         .status()?;
 
     if !status.success() {
-        return Err(io::Error::new(io::ErrorKind::Other, "Failed to create directory"));
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Failed to create directory",
+        ));
     }
 
     Ok(())
@@ -549,7 +650,10 @@ fn sudo_copy_dir(source: &Path, target: &Path) -> io::Result<()> {
 
     let status = cmd.status()?;
     if !status.success() {
-        return Err(io::Error::new(io::ErrorKind::Other, "Failed to copy directory"));
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Failed to copy directory",
+        ));
     }
 
     Ok(())

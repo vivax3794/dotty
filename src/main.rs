@@ -59,6 +59,10 @@ enum Command {
     Update,
 }
 
+#[expect(
+    clippy::enum_variant_names,
+    reason = "This is just because we dont have any other debug commands yet"
+)]
 #[derive(Subcommand, Debug, Clone)]
 enum DebugCommand {
     /// Prints the current configuration
@@ -97,7 +101,6 @@ fn main() -> Result<()> {
         }
         Command::Update => {
             let config = read_config(&cli.config_path())?;
-            let state = read_config(&cli.state_path()).unwrap_or_default();
 
             let changes = config.update()?;
             for change in changes {
