@@ -57,7 +57,7 @@ impl<T: From<Box<str>> + Clone> DerefMut for SupportsShorthand<T> {
 #[serde(default)]
 pub struct Config {
     managers: HashMap<Box<str>, Manager>,
-    packages: HashMap<Box<str>, Vec<Box<str>>>,
+    packages: HashMap<Box<str>, HashSet<Box<str>>>,
     module: Module,
     dotty: DottyConfig,
     hooks: Hooks,
@@ -150,7 +150,7 @@ pub struct Manager {
     pub remove: Option<Box<str>>,
     pub update: Option<Box<str>>,
     pub sudo: bool,
-    pub seperator: Option<Box<str>>,
+    pub seperator: Box<str>,
     pub priority: u8,
 }
 
@@ -161,7 +161,7 @@ impl Default for Manager {
             remove: None,
             update: None,
             sudo: false,
-            seperator: Some(" ".into()),
+            seperator: " ".into(),
             priority: 50,
         }
     }
@@ -172,13 +172,24 @@ impl Default for Manager {
 #[serde(transparent)]
 struct TemplateContext(HashMap<Box<str>, TemplateValue>);
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Eq)]
 #[serde(deny_unknown_fields)]
 #[serde(untagged)]
 enum TemplateValue {
     Value(Box<str>),
     Mapping(HashMap<Box<str>, TemplateValue>),
     Sequence(Vec<TemplateValue>),
+}
+
+impl PartialEq for TemplateValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Value(a), Self::Value(b)) => a == b,
+            (Self::Mapping(a), Self::Mapping(b)) => a == b,
+            (Self::Sequence(a), Self::Sequence(b)) => a.iter().all(|e| b.contains(e)),
+            _ => false,
+        }
+    }
 }
 
 impl TemplateValue {
@@ -216,12 +227,15 @@ impl Config {
                     remove: Some("pacman -Rns #:?".into()),
                     update: Some("pacman -Syu".into()),
                     sudo: true,
-                    seperator: Some(" ".into()),
+                    seperator: " ".into(),
                     priority: 50,
                 },
             )]),
             module: Module::default(),
-            packages: HashMap::from([("pacman".into(), vec!["neovim".into(), "git".into()])]),
+            packages: HashMap::from([(
+                "pacman".into(),
+                HashSet::from(["neovim".into(), "git".into()]),
+            )]),
             hooks: Hooks::default(),
             dotty: DottyConfig {},
             files: HashMap::new(),
@@ -270,7 +284,7 @@ impl Config {
 
     pub fn update(&self) -> Result<Vec<Change>> {
         let mut changes = Vec::new();
-        let empty = Vec::new();
+        let empty = HashSet::new();
         for (name, manager) in self.managers.iter() {
             if let Some(command) = &manager.update {
                 let command = if manager.sudo {
@@ -281,8 +295,12 @@ impl Config {
 
                 let packages = self.packages.get(name).unwrap_or(&empty);
 
-                if let Some(seperator) = &manager.seperator {
-                    let joined = packages.join(seperator);
+                if !manager.seperator.is_empty() {
+                    let joined = packages
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(&manager.seperator);
                     changes.push(Change::RawCommand {
                         command: command.replace("#:?", &joined).into(),
                         priority: manager.priority,
@@ -316,30 +334,27 @@ impl Config {
         let managers = self.managers.keys().collect::<Vec<_>>();
 
         // Since the hashmap returns references `unwrap_or` needs a reference for the default
-        let empty = Vec::new();
+        let empty = HashSet::new();
         for mananger in managers {
             let new_packages = self.packages.get(mananger).unwrap_or(&empty);
             let current_packages = old.packages.get(mananger).unwrap_or(&empty);
 
-            let new_packages: HashSet<&Box<str>> = HashSet::from_iter(new_packages.iter());
-            let current_packages = HashSet::from_iter(current_packages.iter());
-
-            let added = new_packages.difference(&current_packages);
-            let removed = current_packages.difference(&new_packages);
+            let added = new_packages.difference(current_packages);
+            let removed = current_packages.difference(new_packages);
 
             let added = added.map(|x| (*x).clone()).collect::<Vec<_>>();
             let removed = removed.map(|x| (*x).clone()).collect::<Vec<_>>();
 
-            if !added.is_empty() {
-                changes.push(Change::AddPackage {
-                    manager: mananger.clone(),
-                    packages: added,
-                });
-            }
             if !removed.is_empty() {
                 changes.push(Change::RemovePackage {
                     manager: mananger.clone(),
                     packages: removed,
+                });
+            }
+            if !added.is_empty() {
+                changes.push(Change::AddPackage {
+                    manager: mananger.clone(),
+                    packages: added,
                 });
             }
         }
@@ -516,8 +531,8 @@ fn construct_command(
     manager: &Manager,
     command: &str,
 ) -> std::result::Result<Vec<Action>, anyhow::Error> {
-    if let Some(seperator) = &manager.seperator {
-        let args = packages.join(seperator);
+    if !manager.seperator.is_empty() {
+        let args = packages.join(&manager.seperator);
         Ok(vec![Action::Run {
             command: command.replace("#:?", &args).into(),
             sudo: manager.sudo,
