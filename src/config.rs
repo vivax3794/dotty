@@ -186,7 +186,9 @@ impl PartialEq for TemplateValue {
         match (self, other) {
             (Self::Value(a), Self::Value(b)) => a == b,
             (Self::Mapping(a), Self::Mapping(b)) => a == b,
-            (Self::Sequence(a), Self::Sequence(b)) => a.iter().all(|e| b.contains(e)),
+            (Self::Sequence(a), Self::Sequence(b)) => {
+                a.len() == b.len() && a.iter().all(|e| b.contains(e))
+            }
             _ => false,
         }
     }
